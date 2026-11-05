@@ -1,0 +1,85 @@
+name: Release plugin
+
+# Push a tag like v1.0.0.0 to publish a new version:
+#   git tag v1.0.0.0 && git push origin v1.0.0.0
+# This builds the plugin, attaches the zip to a GitHub release, and updates
+# manifest.json on the default branch so Jellyfin's plugin catalog sees it.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  PLUGIN_NAME: Chapter Skip
+  PLUGIN_GUID: 5a54a0b5-3654-4a1b-81f4-2b3f0f81b262
+  TARGET_ABI: 10.11.0.0
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Work out version
+        id: v
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          # pad to 4 parts, e.g. 1.2 -> 1.2.0.0
+          while [ "$(echo "$V" | tr -cd '.' | wc -c)" -lt 3 ]; do V="$V.0"; done
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "zip=chapter-skip_$V.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Build at the tagged commit
+        run: |
+          git checkout "$GITHUB_REF_NAME" -- Jellyfin.Plugin.ChapterSkip
+          dotnet publish Jellyfin.Plugin.ChapterSkip/Jellyfin.Plugin.ChapterSkip.csproj -c Release -o out \
+            -p:AssemblyVersion=${{ steps.v.outputs.version }} -p:FileVersion=${{ steps.v.outputs.version }}
+          (cd out && zip ../${{ steps.v.outputs.zip }} Jellyfin.Plugin.ChapterSkip.dll)
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "${{ steps.v.outputs.zip }}" \
+            --title "Chapter Skip ${{ steps.v.outputs.version }}" --notes "Chapter Skip ${{ steps.v.outputs.version }}"
+
+      - name: Update manifest.json
+        run: |
+          git checkout -- Jellyfin.Plugin.ChapterSkip
+          [ -f manifest.json ] || echo '[]' > manifest.json
+          jq \
+            --arg guid "$PLUGIN_GUID" \
+            --arg name "$PLUGIN_NAME" \
+            --arg owner "${{ github.repository_owner }}" \
+            --arg version "${{ steps.v.outputs.version }}" \
+            --arg abi "$TARGET_ABI" \
+            --arg url "https://github.com/${{ github.repository }}/releases/download/$GITHUB_REF_NAME/${{ steps.v.outputs.zip }}" \
+            --arg md5 "$(md5sum "${{ steps.v.outputs.zip }}" | cut -d' ' -f1)" \
+            --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '
+            (if length == 0 then [{
+              guid: $guid, name: $name, owner: $owner, category: "General",
+              description: "Previous/next chapter buttons for the comic & manga reader.",
+              overview: "Adds chapter navigation to the web reader for series where each chapter is its own .cbz/.cbr file.",
+              versions: []
+            }] else . end)
+            | .[0].versions = ([{
+                version: $version, changelog: ("Release " + $version), targetAbi: $abi,
+                sourceUrl: $url, checksum: $md5, timestamp: $ts
+              }] + [.[0].versions[] | select(.version != $version)])
+            ' manifest.json > manifest.tmp && mv manifest.tmp manifest.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add manifest.json
+          git commit -m "Update manifest for ${{ steps.v.outputs.version }}"
+          git push
