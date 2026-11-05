@@ -1,0 +1,36 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Deploy plugin (tag & push)",
+            "detail": "Pushes the current branch, creates the release tag, and pushes it so GitHub builds the release.",
+            "type": "shell",
+            "command": "git push && git tag -a ${input:releaseTag} -m \"Release ${input:releaseTag}\" && git push origin ${input:releaseTag}",
+            "windows": {
+                "options": {
+                    "shell": {
+                        "executable": "cmd.exe",
+                        "args": [
+                            "/d",
+                            "/c"
+                        ]
+                    }
+                }
+            },
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "clear": true
+            }
+        }
+    ],
+    "inputs": [
+        {
+            "id": "releaseTag",
+            "type": "promptString",
+            "description": "Release tag (4-part version, e.g. v1.0.2.0)",
+            "default": "v1.0.1.0"
+        }
+    ]
+}

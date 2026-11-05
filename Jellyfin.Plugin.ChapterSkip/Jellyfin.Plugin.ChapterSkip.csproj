@@ -4,8 +4,8 @@
     <!-- Jellyfin 10.11.x runs on .NET 9 -->
     <TargetFramework>net9.0</TargetFramework>
     <RootNamespace>Jellyfin.Plugin.ChapterSkip</RootNamespace>
-    <AssemblyVersion>1.0.1.0</AssemblyVersion>
-    <FileVersion>1.0.1.0</FileVersion>
+    <AssemblyVersion>1.0.2.0</AssemblyVersion>
+    <FileVersion>1.0.2.0</FileVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>

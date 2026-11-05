@@ -22,23 +22,67 @@
     var DOWNLOAD_RE = /\/Items\/([0-9a-fA-F-]{32,36})\/Download/i;
     var collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
 
+    // Start downloading the next chapter in the background when you are this many
+    // pages from the end, so it opens without waiting for the download.
+    var PRELOAD_PAGES_BEFORE_END = 5;
+
     var lastDownloadedItemId = null;
     var siblingCache = {};
     var busy = false;
+    var preloaded = null; // { id, promise<Blob> } - only one chapter is kept at a time
+
+    function normId(id) {
+        return String(id).replace(/-/g, '').toLowerCase();
+    }
 
     // ---------------------------------------------------------------------------
     // 1. Learn which book the reader opened. The comics reader downloads the
     //    archive with fetch('/Items/<id>/Download'), so we watch for that URL.
+    //    If we already preloaded that chapter, hand the reader our copy instead.
     // ---------------------------------------------------------------------------
     var originalFetch = window.fetch;
     window.fetch = function (input) {
         try {
             var url = typeof input === 'string' ? input : (input && input.url) || String(input);
             var m = DOWNLOAD_RE.exec(url);
-            if (m) lastDownloadedItemId = m[1].replace(/-/g, '').toLowerCase();
+            if (m) {
+                var id = normId(m[1]);
+                lastDownloadedItemId = id;
+                if (preloaded && preloaded.id === id) {
+                    var hit = preloaded;
+                    preloaded = null;
+                    var self = this, args = arguments;
+                    console.log(LOG, 'using preloaded chapter');
+                    return hit.promise.then(function (blob) {
+                        return new Response(blob, { status: 200, headers: { 'Content-Type': blob.type || 'application/octet-stream' } });
+                    }, function () {
+                        return originalFetch.apply(self, args);
+                    });
+                }
+            }
         } catch (e) { /* ignore */ }
         return originalFetch.apply(this, arguments);
     };
+
+    function preload(item) {
+        var id = normId(item.Id);
+        if (preloaded && preloaded.id === id) return;
+        var c = client();
+        var url = c.getUrl('Items/' + item.Id + '/Download');
+        console.log(LOG, 'preloading', item.Name);
+        var promise = originalFetch(url, {
+            headers: { Authorization: 'MediaBrowser Token="' + c.accessToken() + '"' }
+        }).then(function (res) {
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            return res.blob();
+        });
+        var entry = { id: id, promise: promise };
+        promise.catch(function (e) {
+            console.warn(LOG, 'preload failed', e && e.message);
+            if (preloaded === entry) preloaded = null;
+        });
+        preloaded = entry;
+    }
 
     // ---------------------------------------------------------------------------
     // 2. Server helpers (uses the web client's own logged-in ApiClient)
@@ -103,19 +147,17 @@
             var items = (result.Items || []).slice();
             items.sort(function (a, b) { return collator.compare(fileName(a), fileName(b)); });
 
-            var index = -1;
+            // Cache the answer for every chapter in this folder, so the next one
+            // doesn't need to ask the server again.
             for (var i = 0; i < items.length; i++) {
-                if (items[i].Id.replace(/-/g, '').toLowerCase() === itemId) { index = i; break; }
+                siblingCache[normId(items[i].Id)] = {
+                    prev: i > 0 ? items[i - 1] : null,
+                    next: i < items.length - 1 ? items[i + 1] : null,
+                    index: i,
+                    total: items.length
+                };
             }
-
-            var info = {
-                prev: index > 0 ? items[index - 1] : null,
-                next: index >= 0 && index < items.length - 1 ? items[index + 1] : null,
-                index: index,
-                total: items.length
-            };
-            siblingCache[itemId] = info;
-            return info;
+            return siblingCache[itemId] || { prev: null, next: null, index: -1, total: items.length };
         });
     }
 
@@ -150,10 +192,11 @@
         button.setAttribute('data-positionticks', '0');
 
         // The web client adds the "itemsContainer" class once it has taken over the element.
-        return waitFor(function () { return container.classList.contains('itemsContainer'); }, 3000, 25)
+        // This is near-instant when it works, so give up quickly when it doesn't.
+        return waitFor(function () { return container.classList.contains('itemsContainer'); }, 400, 10)
             .then(function (ready) {
                 if (!ready) throw new Error('item container was not set up by the web client');
-                return new Promise(function (r) { setTimeout(r, 50); });
+                return new Promise(function (r) { setTimeout(r, 0); });
             })
             .then(function () {
                 button.click();
@@ -221,6 +264,12 @@
     }
 
     function closeReader(player) {
+        // Closing the reader steps the browser history back one entry; opening the next
+        // chapter before that settles would close it again, so we wait for it (briefly).
+        var historySettled = false;
+        function onPopState() { historySettled = true; }
+        window.addEventListener('popstate', onPopState);
+
         // The first button in the top bar is the reader's own "Back" button.
         var back = player.querySelector('.bookOsd .bookOsdRow button');
         if (back) {
@@ -228,22 +277,42 @@
         } else {
             document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
         }
-        return waitFor(function () { return !document.body.contains(player); }, 4000)
-            .then(function () { return new Promise(function (r) { setTimeout(r, 600); }); });
+        return waitFor(function () { return !document.body.contains(player); }, 4000, 20)
+            .then(function () { return waitFor(function () { return historySettled; }, 300, 10); })
+            .then(function () {
+                window.removeEventListener('popstate', onPopState);
+                return new Promise(function (r) { setTimeout(r, 30); });
+            });
+    }
+
+    // A black cover shown from the click until the next chapter's reader appears,
+    // so you don't see the series page flash in between.
+    function showTransition(target) {
+        var cover = document.createElement('div');
+        cover.className = 'chapterSkipTransition';
+        cover.innerHTML = '<div class="chapterSkipSpinner"></div><div></div>';
+        cover.lastChild.textContent = target.Name;
+        document.body.appendChild(cover);
+        return function hide() { cover.remove(); };
     }
 
     function goToChapter(player, state, target, isForward) {
         if (busy || !target) return;
         busy = true;
         var finished = isForward && state.swiper && state.swiper.isEnd;
+        var hideTransition = showTransition(target);
 
         closeReader(player)
             .then(function () {
-                if (finished && MARK_PLAYED_ON_FINISH) return markPlayed(state.itemId);
+                // Don't make the next chapter wait for this.
+                if (finished && MARK_PLAYED_ON_FINISH) markPlayed(state.itemId);
+                return openInReader(target);
             })
-            .then(function () { return openInReader(target); })
             .catch(function (e) { console.error(LOG, e); })
-            .then(function () { busy = false; });
+            .then(function () {
+                hideTransition();
+                busy = false;
+            });
     }
 
     // ---------------------------------------------------------------------------
@@ -265,7 +334,12 @@
             '.chapterSkipCard .chapterSkipGo{flex-shrink:0;border:0;border-radius:.4em;padding:.6em 1em;cursor:pointer;',
             '  font:inherit;font-weight:600;background:#00a4dc;color:#fff;}',
             '.chapterSkipCard .chapterSkipClose{flex-shrink:0;border:0;background:none;color:#fff;opacity:.7;cursor:pointer;font-size:1.3em;}',
-            '@media (orientation: landscape) and (max-width: 60em){.chapterSkipCard{bottom:calc(10vh + 1em);}}'
+            '@media (orientation: landscape) and (max-width: 60em){.chapterSkipCard{bottom:calc(10vh + 1em);}}',
+            '.chapterSkipTransition{position:fixed;inset:0;z-index:99999;background:#000;color:#fff;display:flex;',
+            '  flex-direction:column;align-items:center;justify-content:center;gap:1em;font-size:1.1rem;}',
+            '.chapterSkipSpinner{width:2.5em;height:2.5em;border:.25em solid rgba(255,255,255,.2);border-top-color:#00a4dc;',
+            '  border-radius:50%;animation:chapterSkipSpin .8s linear infinite;}',
+            '@keyframes chapterSkipSpin{to{transform:rotate(360deg);}}'
         ].join('\n');
         document.head.appendChild(style);
     }
@@ -385,8 +459,17 @@
                 setTimeout(function () {
                     state.wasAtEnd = swiper.isEnd;
                     updateCard();
+                    maybePreload();
                 }, 0);
             });
+
+            function maybePreload() {
+                if (!state.chapters || !state.chapters.next) return;
+                var total = swiper.virtual && swiper.virtual.slides ? swiper.virtual.slides.length : swiper.slides.length;
+                if (swiper.isEnd || swiper.activeIndex >= total - PRELOAD_PAGES_BEFORE_END) {
+                    preload(state.chapters.next);
+                }
+            }
             state.wasAtEnd = swiper.isEnd;
 
             return getChapters(state.itemId).then(function (chapters) {
@@ -397,6 +480,7 @@
                 if (chapters.next) nextBtn.title = 'Next chapter: ' + chapters.next.Name;
                 player.appendChild(card);
                 updateCard();
+                maybePreload();
             });
         }).catch(function (e) {
             console.error(LOG, e);
