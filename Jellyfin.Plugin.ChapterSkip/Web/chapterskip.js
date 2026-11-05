@@ -127,9 +127,50 @@
         ]).catch(function (e) { console.warn(LOG, 'could not mark as read', e); });
     }
 
-    // Ask the server to tell *this* browser to start reading the item.
-    // (Same mechanism as "Play on..." remote control, aimed at ourselves.)
-    function openInReader(item) {
+    function readerIsOpen() {
+        return !!document.getElementById('comicsPlayer');
+    }
+
+    // Method 1: start reading the same way a "Play" button on an item card does.
+    // We build a hidden card inside one of the web client's own item containers and
+    // click its play action, so the web client's own playback code opens the reader.
+    function playLikeACard(item, serverId) {
+        var host = document.createElement('div');
+        host.style.cssText = 'position:fixed;width:0;height:0;overflow:hidden;opacity:0;pointer-events:none;';
+        document.body.appendChild(host);
+        host.innerHTML = '<div is="emby-itemscontainer" data-contextmenu="false">'
+            + '<button type="button" class="itemAction" data-action="play"></button></div>';
+        var container = host.firstElementChild;
+        var button = container.firstElementChild;
+        button.setAttribute('data-id', item.Id);
+        button.setAttribute('data-serverid', serverId);
+        button.setAttribute('data-type', item.Type || 'Book');
+        button.setAttribute('data-mediatype', item.MediaType || 'Book');
+        button.setAttribute('data-isfolder', 'false');
+        button.setAttribute('data-positionticks', '0');
+
+        // The web client adds the "itemsContainer" class once it has taken over the element.
+        return waitFor(function () { return container.classList.contains('itemsContainer'); }, 3000, 25)
+            .then(function (ready) {
+                if (!ready) throw new Error('item container was not set up by the web client');
+                return new Promise(function (r) { setTimeout(r, 50); });
+            })
+            .then(function () {
+                button.click();
+                return waitFor(readerIsOpen, 8000, 100);
+            })
+            .then(function (opened) {
+                setTimeout(function () { host.remove(); }, 500);
+                if (!opened) throw new Error('reader did not open after clicking play');
+            }, function (e) {
+                host.remove();
+                throw e;
+            });
+    }
+
+    // Method 2: ask the server to tell this browser to start reading
+    // (the "remote control" route; needs a working websocket connection).
+    function playViaServer(item) {
         var c = client();
         return getJson('Sessions', { deviceId: c.deviceId() }).then(function (sessions) {
             if (!sessions || !sessions.length) throw new Error('own session not found');
@@ -138,15 +179,31 @@
                 itemIds: item.Id,
                 startPositionTicks: 0
             });
-        }).catch(function (e) {
-            console.warn(LOG, 'could not open reader directly, going to the item page instead', e);
-            var serverId = item.ServerId || c.serverId();
-            if (window.Emby && window.Emby.Page && window.Emby.Page.showItem) {
-                window.Emby.Page.showItem(item.Id, serverId);
-            } else {
-                window.location.hash = '#/details?id=' + item.Id + '&serverId=' + serverId;
-            }
+        }).then(function () {
+            return waitFor(readerIsOpen, 6000, 100);
+        }).then(function (opened) {
+            if (!opened) throw new Error('reader did not open after server play command');
         });
+    }
+
+    function openInReader(item) {
+        var c = client();
+        var serverId = item.ServerId || c.serverId();
+        console.log(LOG, 'opening', item.Name, item.Id);
+
+        return playLikeACard(item, serverId)
+            .catch(function (e) {
+                console.warn(LOG, 'method 1 failed:', e && e.message, '- trying server play command');
+                return playViaServer(item);
+            })
+            .catch(function (e) {
+                console.warn(LOG, 'method 2 failed:', e && e.message, '- opening the chapter page instead');
+                if (window.Emby && window.Emby.Page && window.Emby.Page.showItem) {
+                    window.Emby.Page.showItem(item.Id, serverId);
+                } else {
+                    window.location.hash = '#/details?id=' + item.Id + '&serverId=' + serverId;
+                }
+            });
     }
 
     // ---------------------------------------------------------------------------
@@ -172,7 +229,7 @@
             document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
         }
         return waitFor(function () { return !document.body.contains(player); }, 4000)
-            .then(function () { return new Promise(function (r) { setTimeout(r, 300); }); });
+            .then(function () { return new Promise(function (r) { setTimeout(r, 600); }); });
     }
 
     function goToChapter(player, state, target, isForward) {
